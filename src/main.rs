@@ -22,7 +22,7 @@ enum Subcommand {
     Mint(MintOpt),
 
     /// Show remaining balances to mint.
-    Balances(BalancesOpt),
+    Balance(BalancesOpt),
 }
 
 #[derive(Debug, Parser)]
@@ -44,6 +44,10 @@ pub struct MintOpt {
     /// A memo to pass to the minting command.
     #[clap(long)]
     memo: Option<String>,
+
+    /// Only output JSON, not the full command line.
+    #[clap(long)]
+    json: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -63,7 +67,7 @@ fn read_all_jsons(root: impl AsRef<Path>) -> Result<BTreeMap<String, f64>, anyho
                 let tokens = match &value {
                     Value::Number(n) => n.as_f64(),
                     Value::String(s) => {
-                        let s = s.replace(",", "");
+                        let s = s.replace(',', "");
                         s.parse::<f64>().ok()
                     }
                     x => {
@@ -88,12 +92,19 @@ fn mint(
     balances: BTreeMap<String, f64>,
     opts: &MintOpt,
 ) -> Result<(), anyhow::Error> {
+    let now = chrono::Local::now();
+
     let mut rand = thread_rng();
+    eprintln!("Minting tokens...");
+    eprintln!("Date: {}", now.to_rfc2822());
+    eprintln!("Flags: {opts:?}");
+    eprintln!();
+
     let to_mint = balances
         .into_iter()
         .map(|(id, balance)| {
             let max = if opts.randomize {
-                opts.max * rand.gen_range(0.9..1.1)
+                opts.max * rand.gen_range(0.8..1.2)
             } else {
                 opts.max
             };
@@ -101,7 +112,6 @@ fn mint(
         })
         .filter(|(_, balance)| *balance > 0.0)
         .map(|(id, amount)| {
-            eprintln!("{}: {}", id, amount);
             // A small sanity check.
             if amount > DENOMINATOR {
                 panic!("Invalid amount '{}' for id '{}'", amount, id);
@@ -111,12 +121,27 @@ fn mint(
             (id, amount)
         })
         .collect::<BTreeMap<_, _>>();
+    let longest = to_mint
+        .values()
+        .map(|s| format!("{:.09}", *s as f64 / DENOMINATOR).len())
+        .max()
+        .unwrap_or(0);
+    to_mint.iter().for_each(|(id, s)| {
+        eprintln!(
+            "{}\t{:>width$}",
+            id,
+            format!("{:.09}", (*s as f64) / DENOMINATOR),
+            width = longest
+        );
+    });
+
+    eprintln!("--------------------------------------------------");
 
     // Commit a new file to disk.
-    let now = chrono::Local::now();
     let output = root
         .as_ref()
         .join(format!("mint-{}.json", now.format("%Y%m%d-%H%M%S")));
+
     if !opts.dry_run {
         std::fs::write(
             output,
@@ -129,8 +154,12 @@ fn mint(
         )?;
     }
 
-    // Output the command line to run.
-    println!("ledger --pem {}/MFX_Token.pem https://alberto.app/api token mint mqbh742x4s356ddaryrxaowt4wxtlocekzpufodvowrirfrqaaaaa3l '{:#?}'", root.as_ref().display(), to_mint );
+    if opts.json {
+        println!("{}", serde_json::to_string_pretty(&to_mint)?);
+    } else {
+        // Output the command line to run.
+        println!("ledger --pem {}/MFX_Token.pem https://alberto.app/api token mint mqbh742x4s356ddaryrxaowt4wxtlocekzpufodvowrirfrqaaaaa3l '{:#?}'", root.as_ref().display(), to_mint);
+    }
 
     Ok(())
 }
@@ -155,6 +184,6 @@ fn main() -> Result<(), anyhow::Error> {
 
     match opts.subcommand {
         Subcommand::Mint(opts) => mint(root, b, &opts),
-        Subcommand::Balances(opts) => balances(root, b, &opts),
+        Subcommand::Balance(opts) => balances(root, b, &opts),
     }
 }
