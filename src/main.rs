@@ -128,10 +128,9 @@ fn mint(
         .unwrap_or(0);
     to_mint.iter().for_each(|(id, s)| {
         eprintln!(
-            "{}\t{:>width$}",
+            "{}\t{:>longest$}",
             id,
             format!("{:.09}", (*s as f64) / DENOMINATOR),
-            width = longest
         );
     });
 
