@@ -2,6 +2,8 @@ use clap::Parser;
 use rand::{thread_rng, Rng};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const DENOMINATOR: f64 = 1_000_000_000.0;
@@ -9,8 +11,8 @@ const DENOMINATOR: f64 = 1_000_000_000.0;
 #[derive(Debug, Parser)]
 struct Opt {
     /// The directory that contains the JSON files and the PEM file.
-    #[clap(long, global = true)]
-    dir: Option<PathBuf>,
+    #[clap(long)]
+    dir: PathBuf,
 
     #[clap(subcommand)]
     subcommand: Subcommand,
@@ -22,7 +24,7 @@ enum Subcommand {
     Mint(MintOpt),
 
     /// Show remaining balances to mint.
-    Balance(BalancesOpt),
+    Balances(BalancesOpt),
 }
 
 #[derive(Debug, Parser)]
@@ -36,7 +38,7 @@ pub struct MintOpt {
     #[clap(long)]
     dry_run: bool,
 
-    /// Whether to randomize the amount, within 10% of the maximum. Each id
+    /// Whether to randomize the amount, within 20% of the maximum. Each id
     /// will have a different randomized maximum.
     #[clap(long)]
     randomize: bool,
@@ -48,14 +50,18 @@ pub struct MintOpt {
     /// Only output JSON, not the full command line.
     #[clap(long)]
     json: bool,
+
+    /// The pem file to use for the command line.
+    #[clap(long)]
+    pem: PathBuf,
 }
 
 #[derive(Debug, Parser)]
 pub struct BalancesOpt {}
 
-fn read_all_jsons(root: impl AsRef<Path>) -> Result<BTreeMap<String, f64>, anyhow::Error> {
+fn read_all_jsons(root: impl AsRef<Path>) -> Result<BTreeMap<String, u64>, anyhow::Error> {
     // Read all the JSON files.
-    let mut to_mint = BTreeMap::<String, f64>::new();
+    let mut balance = BTreeMap::<String, i128>::new();
 
     for entry in std::fs::read_dir(root).unwrap() {
         let entry = entry?;
@@ -66,17 +72,24 @@ fn read_all_jsons(root: impl AsRef<Path>) -> Result<BTreeMap<String, f64>, anyho
             for (name, value) in data {
                 let tokens = match &value {
                     Value::Number(n) => n.as_f64(),
-                    Value::String(s) => {
-                        let s = s.replace(',', "");
-                        s.parse::<f64>().ok()
-                    }
+                    Value::String(s) => s.replace(',', "").parse::<f64>().ok(),
                     x => {
                         panic!("Invalid value type '{}' in file '{:?}'", x, path);
                     }
                 };
                 if let Some(tokens) = tokens {
-                    let curr = to_mint.entry(name).or_default();
-                    *curr += tokens;
+                    // A small sanity check. This means that a period was missed or
+                    // something.
+                    if tokens > DENOMINATOR {
+                        panic!("Invalid token amount '{}' in file '{:?}'", value, path);
+                    }
+
+                    let tokens = (tokens * DENOMINATOR) as i128;
+                    let curr = balance.entry(name).or_default();
+
+                    // Make sure we don't end up with a negative or too small balance.
+                    let new = *curr + tokens;
+                    *curr = new;
                 } else {
                     panic!("Invalid token amount '{}' in file '{:?}'", value, path);
                 }
@@ -84,13 +97,26 @@ fn read_all_jsons(root: impl AsRef<Path>) -> Result<BTreeMap<String, f64>, anyho
         }
     }
 
-    Ok(to_mint)
+    Ok(balance
+        .into_iter()
+        .filter_map(|(k, v)| {
+            if v >= u64::MAX as i128 {
+                panic!("Balance for '{}' is too large", k);
+            }
+
+            if v > 0 {
+                Some((k, v as u64))
+            } else {
+                None
+            }
+        })
+        .collect())
 }
 
 fn mint(
     root: impl AsRef<Path>,
-    balances: BTreeMap<String, f64>,
-    opts: &MintOpt,
+    balances: BTreeMap<String, u64>,
+    opts: MintOpt,
 ) -> Result<(), anyhow::Error> {
     let now = chrono::Local::now();
 
@@ -100,27 +126,28 @@ fn mint(
     eprintln!("Flags: {opts:?}");
     eprintln!();
 
+    let MintOpt {
+        dry_run,
+        memo,
+        randomize,
+        max,
+        json,
+        pem,
+    } = opts;
+    let max = (max * DENOMINATOR) as u64;
+
     let to_mint = balances
         .into_iter()
         .map(|(id, balance)| {
-            let max = if opts.randomize {
-                opts.max * rand.gen_range(0.8..1.2)
+            let max = if randomize {
+                ((max as f64) * rand.gen_range(0.8..1.2)) as u64
             } else {
-                opts.max
+                max
             };
             (id, balance.min(max))
         })
-        .filter(|(_, balance)| *balance > 0.0)
-        .map(|(id, amount)| {
-            // A small sanity check.
-            if amount > DENOMINATOR {
-                panic!("Invalid amount '{}' for id '{}'", amount, id);
-            }
-
-            let amount = (amount * DENOMINATOR) as u64;
-            (id, amount)
-        })
         .collect::<BTreeMap<_, _>>();
+
     let longest = to_mint
         .values()
         .map(|s| format!("{:.09}", *s as f64 / DENOMINATOR).len())
@@ -136,28 +163,43 @@ fn mint(
 
     eprintln!("--------------------------------------------------");
 
-    // Commit a new file to disk.
-    let output = root
-        .as_ref()
-        .join(format!("mint-{}.json", now.format("%Y%m%d-%H%M%S")));
+    if !dry_run {
+        // Commit a new file to disk.
+        let output = root
+            .as_ref()
+            .join(format!("mint-{}.json", now.format("%Y%m%d-%H%M%S")));
 
-    if !opts.dry_run {
-        std::fs::write(
-            output,
+        writeln!(
+            File::create(output).unwrap(),
+            "{}",
             serde_json::to_string_pretty(
                 &to_mint
                     .iter()
-                    .map(|(id, amount)| (id.clone(), -((*amount as f64) / DENOMINATOR)))
+                    .map(|(id, amount)| (
+                        id.clone(),
+                        (-((*amount as f64) / DENOMINATOR)).to_string()
+                    ))
                     .collect::<BTreeMap<_, _>>(),
             )?,
         )?;
     }
 
-    if opts.json {
+    if json {
         println!("{}", serde_json::to_string_pretty(&to_mint)?);
-    } else {
+    } else if !to_mint.is_empty() {
+        let to_mint = to_mint
+            .iter()
+            .map(|(id, amount)| format!(r#"    "{}": {}"#, id, amount))
+            .collect::<Vec<_>>()
+            .join(",\n");
+        let to_mint = format!("{{\n{}\n}}", to_mint);
+
         // Output the command line to run.
-        println!("ledger --pem {}/MFX_Token.pem https://alberto.app/api token mint mqbh742x4s356ddaryrxaowt4wxtlocekzpufodvowrirfrqaaaaa3l '{:#?}'", root.as_ref().display(), to_mint);
+        println!("ledger --pem {} https://alberto.app/api token mint mqbh742x4s356ddaryrxaowt4wxtlocekzpufodvowrirfrqaaaaa3l '{}' {}", pem.display(), to_mint, if let Some(m) = memo {
+            format!("--memo '{m}'")
+        } else {
+            "".to_string()
+        });
     }
 
     Ok(())
@@ -165,12 +207,12 @@ fn mint(
 
 fn balances(
     _root: impl AsRef<Path>,
-    balances: BTreeMap<String, f64>,
-    _opts: &BalancesOpt,
+    balances: BTreeMap<String, u64>,
+    _opts: BalancesOpt,
 ) -> Result<(), anyhow::Error> {
     for (id, balance) in balances {
-        if balance > 0.0 {
-            println!("{}: {:0.9}", id, balance);
+        if balance > 0 {
+            println!("{}: {:0.9}", id, (balance as f64) / DENOMINATOR);
         }
     }
     Ok(())
@@ -178,11 +220,11 @@ fn balances(
 
 fn main() -> Result<(), anyhow::Error> {
     let opts = Opt::parse();
-    let root = &opts.dir.unwrap_or_else(|| std::env::current_dir().unwrap());
+    let root = &opts.dir;
     let b = read_all_jsons(root)?;
 
     match opts.subcommand {
-        Subcommand::Mint(opts) => mint(root, b, &opts),
-        Subcommand::Balance(opts) => balances(root, b, &opts),
+        Subcommand::Mint(opts) => mint(root, b, opts),
+        Subcommand::Balances(opts) => balances(root, b, opts),
     }
 }
